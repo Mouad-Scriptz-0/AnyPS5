@@ -530,6 +530,17 @@ ImportWatchRequest importWatchRequest() {
 }
 #endif
 
+std::atomic<std::uint64_t> importWindow{0};
+
+// An import unwatches every allocation it spans, and a storage surface in an unwatched allocation
+// compares its whole guest copy per use, so a device whose imports unwatch their range imports one
+// allocation at a time: the neighbours of an imported buffer stay watched.
+void shrinkImportWindow() {
+    constexpr std::uint64_t allocation = 65536;
+    const auto current = importWindow.load(std::memory_order_relaxed);
+    if (current == 0 || current > allocation) importWindow.store(allocation, std::memory_order_relaxed);
+}
+
 void decideImportWatch(const Context& context, HostImports& state) {
     if (state.watchDevice == context.device) return;
 #ifdef _WIN32
@@ -550,15 +561,18 @@ void decideImportWatch(const Context& context, HostImports& state) {
     if (request == ImportWatchRequest::Unwatch) {
         state.unwatchImports = true;
         state.unwatchDmaBufImports = true;
+        shrinkImportWindow();
         std::fprintf(stderr, "[write-watch] host imports are compared, not watched (APS5_WRITE_WATCH_IMPORTS=unwatch)\n");
         return;
     }
     const auto probe = ProbeImportWriteProtection(context);
     if (probe.failure != nullptr) {
         state.unwatchImports = true;
+        shrinkImportWindow();
         std::fprintf(stderr, "[write-watch] host imports resolve write protection: unknown (probe failed at %s, %d); imported ranges are compared\n", probe.failure, static_cast<int>(probe.result));
     } else {
         state.unwatchImports = probe.writtenAfterSubmit != 0 || probe.writtenAfterFill != 0;
+        if (state.unwatchImports) shrinkImportWindow();
         std::fprintf(stderr, "[write-watch] host imports resolve write protection: %s (%u of %u scratch pages written after a GPU read, %u after a GPU write, %u after the import); imported ranges %s\n", state.unwatchImports ? "yes" : "no", probe.writtenAfterSubmit, probe.pages, probe.writtenAfterFill, probe.writtenAtImport, state.unwatchImports ? "are compared" : "stay watched");
     }
     state.unwatchDmaBufImports = state.unwatchImports;
@@ -597,7 +611,6 @@ std::size_t leasedIndexContaining(const GuestAllocations::Lease& lease, std::uin
     return range.readable && address < range.address + range.bytes ? index : lease.size();
 }
 
-std::atomic<std::uint64_t> importWindow{0};
 
 ImportRun importRun(const GuestAllocations::Lease& lease, std::uint64_t address) {
     const auto index = leasedIndexContaining(lease, address);
@@ -662,6 +675,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     if (!importsStale(context, state)) {
         if (const auto* current = findImport(state, address, address + 1)) return current;
     }
+    decideImportWatch(context, state);
     auto run = importRun(lease, address);
     if (run.ranges.empty()) return nullptr;
     const auto base = run.base;
@@ -748,7 +762,6 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         return nullptr;
     }
 #endif
-    decideImportWatch(context, state);
     VkResult result = VK_SUCCESS;
     const char* step = nullptr;
 #ifdef _WIN32
@@ -853,7 +866,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     for (auto it = state.imports.begin(); it != state.imports.end();) {
         const auto* range = leasedRangeAt(lease, it->first);
         if (range != nullptr && sameRange(it->second, lease)) {
-            if (it->second.unwatched) GuestMemory::Unwatch(it->first, it->second.bytes);
+            if (it->second.unwatched && GuestMemory::Watched(it->first, static_cast<std::size_t>(it->second.bytes))) GuestMemory::Unwatch(it->first, it->second.bytes);
             ++it;
             continue;
         }
@@ -1994,6 +2007,7 @@ void SetImportWatch(const Context& context, ImportWatch watch) {
     state.watchDevice = context.device;
     state.unwatchImports = watch == ImportWatch::Unwatch;
     state.unwatchDmaBufImports = state.unwatchImports;
+    if (state.unwatchImports) shrinkImportWindow();
 }
 
 void SetHostImportWindow(std::uint64_t bytes) {
@@ -2014,6 +2028,27 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     if (!runCovers(lease, address, address + bytes)) return nullptr;
     const auto* entry = importAllocation(context, state, address, lease);
     return entry != nullptr && findImport(state, address, address + bytes) == entry ? entry : nullptr;
+}
+
+const HostImport* ExistingHostImport(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    if (importsStale(context, state)) return nullptr;
+    return findImport(state, address, address + bytes);
+}
+
+bool HostImportsUnwatch(const Context& context) {
+    if (context.hostImportAlignment == 0) return false;
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    decideImportWatch(context, state);
+    return state.unwatchImports;
+}
+
+const HostImport* StorageImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (HostImportsUnwatch(context) && GuestMemory::Watched(address, bytes)) return ExistingHostImport(context, address, bytes);
+    return HostImportFor(context, address, bytes);
 }
 
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice) {
