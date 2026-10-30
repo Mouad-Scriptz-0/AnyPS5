@@ -1,5 +1,6 @@
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libkernel/File/include/ArchivedFile.hpp"
+#include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
 #include "prx/libc/include/General.hpp"
 
 #include <algorithm>
@@ -30,10 +31,6 @@ static int ReadHandleInfo(HANDLE handle, NativeStat* st) {
     st->hasIdentity = GetFileInformationByHandle(handle, &st->identity) != 0;
     return 0;
 }
-static std::uint32_t FoldFileIndex(const BY_HANDLE_FILE_INFORMATION& identity) {
-    const std::uint32_t folded = identity.nFileIndexLow ^ (identity.nFileIndexHigh * 0x9E3779B1u);
-    return folded == 0 ? 1 : folded;
-}
 static int DoStat(const std::filesystem::path& p, NativeStat* st) {
     if (_wstat64(p.c_str(), st) != 0) {
         if (_doserrno == ERROR_CANT_RESOLVE_FILENAME) File::WindowsFileTime::Failure(_doserrno);
@@ -57,15 +54,20 @@ static int DoFstat(int fd, NativeStat* st) {
 static int DoLstat(const std::filesystem::path& p, NativeStat* st) {
     const auto attributes = GetFileAttributesW(p.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0) return DoStat(p, st);
+    if (!File::WindowsSymbolicLink::IsNameSurrogate(p, "lstat")) return DoStat(p, st);
     std::string target;
-    if (!File::WindowsSymbolicLink::Read(p, target, "lstat") && !File::WindowsSymbolicLink::ReadJunction(p, target, "lstat"))
-        NotImplemented_nid_no_patch("lstat of a Windows reparse point other than a symbolic link");
+    const bool link = File::WindowsSymbolicLink::Read(p, target, "lstat") || File::WindowsSymbolicLink::ReadJunction(p, target, "lstat");
     const auto handle = CreateFileW(p.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (handle == INVALID_HANDLE_VALUE) return File::WindowsFileTime::Failure(GetLastError());
     const int result = ReadHandleInfo(handle, st);
     CloseHandle(handle);
     if (result != 0) return result;
+    if (!link) {
+        st->st_mode = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ? (_S_IFDIR | 0111) : _S_IFREG;
+        st->st_mode |= (attributes & FILE_ATTRIBUTE_READONLY) != 0 ? 0444 : 0666;
+        return 0;
+    }
     st->st_mode = SymbolicLinkMode;
     st->st_size = static_cast<__int64>(target.size());
     st->isSymbolicLink = true;
@@ -115,7 +117,7 @@ static void CopyNativeStat(const NativeStat& st, FileStat* sb) {
     }
     if (st.hasIdentity) {
         sb->st_dev = st.identity.dwVolumeSerialNumber;
-        sb->st_ino = FoldFileIndex(st.identity);
+        sb->st_ino = WindowsFileNumber_nid_no_patch(st.identity);
         sb->st_nlink = static_cast<std::uint16_t>(std::min<DWORD>(st.identity.nNumberOfLinks, 0xffff));
     }
 #else
@@ -136,7 +138,7 @@ static void CopyNativeStat(const NativeStat& st, FileStat* sb) {
 #if defined(__APPLE__)
     sb->st_birthtim.tv_sec = static_cast<std::int64_t>(st.st_birthtimespec.tv_sec);
     sb->st_birthtim.tv_nsec = static_cast<std::int64_t>(st.st_birthtimespec.tv_nsec);
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__EMSCRIPTEN__)
     sb->st_birthtim = sb->st_ctim;
 #else
     sb->st_birthtim.tv_sec = static_cast<std::int64_t>(st.st_birthtim.tv_sec);
@@ -170,6 +172,14 @@ void FillFileStat(int nativeDescriptor, FileStat* sb) {
 
 bool FillFileStatFromDescriptor(int fd, FileStat* sb) {
     if (FillArchivedStatFromDescriptor(fd, sb)) return true;
+    if (File::IsDirectoryDescriptor(fd) && !File::IsNativeDirectoryDescriptor(fd)) {
+        const auto directory = DirectoryDescriptorPath(fd);
+        if (!directory) { errno = ENOENT; return false; }
+        if (FillArchivedStat(*directory, sb)) return true;
+        if (TryFillFileStat(*directory, sb)) return true;
+        errno = ENOENT;
+        return false;
+    }
     NativeStat st{};
     if (DoFstat(fd, &st) != 0) return false;
     CopyNativeStat(st, sb);

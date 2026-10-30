@@ -314,9 +314,9 @@ std::optional<LaneAffine> LaneAffineOf(const IrValue* value, std::uint32_t depth
 
 }
 
-std::unordered_map<const IrValue*, std::uint32_t> FunctionLdsLaneAddresses(const IrProgram& program) {
+std::unordered_map<const IrValue*, std::uint32_t> FunctionLdsLaneAddresses(const IrProgram& program, std::uint32_t dwords) {
     std::unordered_map<const IrValue*, std::uint32_t> addresses;
-    if (FunctionLdsDwords(program) >= FunctionLdsDwordLimit) return {};
+    if (dwords >= FunctionLdsDwordLimit) return {};
     std::optional<std::uint64_t> stride;
     for (const IrBlock* block : program.BlockOrder()) {
         for (const IrValue* inst : block->Instructions()) {
@@ -376,6 +376,8 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
                 }
                 const auto& memory = program.Resources().memoryInfo.at(memoryIndex);
                 requirements.coherentBuffers = requirements.coherentBuffers || (memory.coherent && !memory.gpuDescriptor);
+                const bool pair = inst->Opcode() == IrOpcode::LoadBufferU32x2 || inst->Opcode() == IrOpcode::StoreBufferU32x2;
+                requirements.coherentBufferPairs = requirements.coherentBufferPairs || (pair && memory.coherent && !memory.gpuDescriptor);
                 if (!memory.planningOnly) {
                     requirements.subgroupLocalInvocationId = requirements.subgroupLocalInvocationId || program.Resources().stage == IrShaderStage::Compute;
                 }
@@ -471,7 +473,7 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
     }
     if (requirements.functionLds) {
         requirements.functionLdsDwords = FunctionLdsDwords(program);
-        requirements.functionLdsAddresses = FunctionLdsLaneAddresses(program);
+        requirements.functionLdsAddresses = FunctionLdsLaneAddresses(program, requirements.functionLdsDwords);
         if (!requirements.functionLdsAddresses.empty()) {
             std::uint64_t needed = 0;
             for (const auto& [inst, address] : requirements.functionLdsAddresses) {
@@ -502,12 +504,13 @@ std::unordered_set<const IrValue*> WaveUniformValues(const IrProgram& program) {
         changed = false;
         for (const IrBlock* block : program.BlockOrder()) {
             for (const IrValue* inst : block->Instructions()) {
+                auto& entry = varying[inst];
+                if (entry) continue;
                 bool lanes = !UniformSource(*inst) && LaneSource(program, *inst);
                 for (std::size_t index = 0; !lanes && !UniformSource(*inst) && index < inst->ArgumentCount(); index++) {
                     if (inst->Argument(index) != nullptr) lanes = isVarying(inst->Argument(index));
                 }
-                auto& entry = varying[inst];
-                if (lanes && !entry) {
+                if (lanes) {
                     entry = true;
                     changed = true;
                 }

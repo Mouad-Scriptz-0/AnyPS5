@@ -6,6 +6,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -38,6 +39,7 @@ struct HostImport {
     // Identity for the life of this import (see HostImportSerial); 0 until first asked for.
     std::uint64_t serial = 0;
     bool unwatched = false;
+    bool settleOnDemand = false;
     bool dmaBuf = false;
     bool joined = false;
     mutable std::uint64_t lastUseFrame = 0;
@@ -75,8 +77,8 @@ ImportProbe ProbeDmaBufImportWriteProtection(const Context& context);
 ImportWatch PrepareImportWatch(const Context& context);
 void SetImportWatch(const Context& context, ImportWatch watch);
 
-enum class ImportRequester : std::uint8_t { Map, Build, Access, Join, Segment };
-inline constexpr std::size_t ImportRequesterCount = 5;
+enum class ImportRequester : std::uint8_t { Map, Build, Access, Join, Segment, ColorTarget };
+inline constexpr std::size_t ImportRequesterCount = 6;
 
 struct HostImportRequesterCounts {
     std::uint64_t made = 0;
@@ -110,6 +112,7 @@ std::size_t RetireIdleImports(const Context& context);
 // The import for a storage surface at [address, address + bytes): where imports unwatch, a surface still
 // in the write watch only takes an import that already exists, so its range stays watched.
 const HostImport* StorageImportFor(const Context& context, std::uint64_t address, std::size_t bytes, ImportRequester requester = ImportRequester::Access);
+bool WatchedAfterSettle(const Context& context, std::uint64_t address, std::size_t bytes);
 void SetHostImportWindow(std::uint64_t bytes);
 // Tests: the window of one large registered range (64 MiB) and the import budget (0: the configured one).
 void SetHostImportRangeWindow(std::uint64_t bytes);
@@ -121,7 +124,13 @@ void SetHostImportDeferredSettles(bool enabled);
 // The larger of 6 GiB and half the physical memory, at most the largest host heap less the larger of 2 GiB and half
 // that heap: the other half stays for the buffers, mirrors and textures that share it.
 std::uint64_t HostImportBudget(const VkPhysicalDeviceMemoryProperties& memory, std::uint64_t physicalBytes);
+void SetHostImportMaxBytes(std::uint64_t bytes);
 std::uint64_t HostImportLiveBytes();
+// A flip ends a frame: an import used in the current or the previous frame is never evicted for another one.
+void NoteHostImportFrame();
+std::uint64_t HostImportFramesEnded();
+std::uint64_t HostImportEpoch();
+std::uint64_t HostImportBudgetRemaining(const Context& context);
 struct HostImportSettleCounts {
     std::uint64_t submitted = 0;
     std::uint64_t waited = 0;
@@ -139,6 +148,7 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
 // made outside the device lock (a sampled texture's path, a dispatch's pre-sync); the path taken
 // re-checks with HostImportFor when it binds the import.
 bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t bytes);
+bool ComparedHostImportCovers(const Context& context, std::uint64_t address, std::size_t bytes);
 struct RegisteredPiece {
     std::uint64_t address;
     std::uint64_t bytes;
@@ -254,6 +264,12 @@ struct MirrorStats {
     std::uint64_t sparseBinds = 0;
 };
 MirrorStats MirrorCounters();
+std::uint64_t SnapshotMismatches();
+struct HeapMirrorHold {
+    std::uint64_t mirrors = 0;
+    std::uint64_t bytes = 0;
+};
+HeapMirrorHold HeapMirrorsWithin(std::uint64_t begin, std::uint64_t end);
 void ClearSnapshotCopies(VkDevice device);
 std::vector<std::uint64_t> AddressTableKey(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::span<const ShaderRecompiler::BdaAbi::Range> own);
 void ClearImageMirrors(VkDevice device);
@@ -264,8 +280,28 @@ struct AddressCopy {
     std::uint64_t end;
     std::uint64_t committed;
     const char* reason;
+    bool heap = false;
+    bool overBudget = false;
 };
 std::string AddressCopyOverflow(std::vector<AddressCopy> copies, std::uint64_t limit);
+
+class AddressCopyCounters {
+public:
+    struct Totals {
+        std::uint64_t bytes = 0;
+        std::uint64_t largest = 0;
+    };
+
+    static AddressCopyCounters& ThisThread();
+    static Totals Fold();
+    static std::uint64_t Limit();
+
+    void Count(std::uint64_t copied);
+
+private:
+    alignas(64) std::atomic<std::uint64_t> bytes{0};
+    std::atomic<std::uint64_t> largest{0};
+};
 
 class GuestBufferMemory {
 public:
@@ -291,12 +327,14 @@ public:
     // calls RecordCopyBacks (a dispatch), since a staged region's results reach guest memory by
     // that copy alone. Call before Upload.
     void AllowDeviceStaging() { stagingAllowed = true; }
+    void DisallowAddressStaging() { addressStaging = false; }
     void AllowAdjustedRegions() { adjustedRegions = true; }
     // Records the copy-in of every staged region anew for another use of this upload (a resource
     // cache hit, from ShaderResources::Revalidate, under GuestMemory::GpuMutex, once the imports
     // were confirmed unchanged): the previous use's copy-back left the shadow behind, and the next
     // RecordCopyBacks copies it back again. Nothing to do without staged regions.
     void RecordStagingCopies(Recorder& recorder);
+    bool StagingDecisionsCurrent() const;
     void AddSnapshot(const GuestMemorySnapshot& snapshot);
     // Upload is the two stages below back to back. UploadPrepare needs no device lock: it merges the
     // regions, binds the image mirrors and host imports that already serve them (an import pointer is
@@ -427,6 +465,8 @@ private:
         // The device refused the shadow (memory or allocations exhausted): the region takes the
         // path it would take without staging, in both upload stages.
         bool unstaged = false;
+        bool overlay = false;
+        bool adaptiveInPlace = false;
     };
 
     // How [begin, end) lies against the space's base regions.
@@ -468,10 +508,14 @@ private:
     // APS5_GPU_COPY_MAX_KIB allows, and APS5_CPU_COPIES unset.
     bool gpuCopyEligible(const Region& region) const;
     // Whether a region inside a host import is staged in device memory instead of bound in place
-    // (see GuestBufferMemory.cpp): staging allowed, not address-based, a written element inside,
-    // and an atomic element or a size within the written-shadow window. Independent of the import,
-    // so UploadPrepare and UploadFinish decide alike.
+    // (see GuestBufferMemory.cpp): staging allowed, not address-based unless an overlay region, a
+    // written element inside, and an atomic element or a size within the written-shadow window.
+    // Independent of the import, so UploadPrepare and UploadFinish decide alike.
     bool stagingEligible(const Region& region, bool addressable) const;
+    bool stagingWanted(const Region& region, bool addressable) const;
+    bool adaptiveInPlace(const Region& region, bool use) const;
+    bool overlayCandidate(const Region& inside, bool readOnly) const;
+    void resolveOverlays();
     bool bindableInPlace(std::uint64_t offset, bool addressable) const;
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
@@ -479,6 +523,7 @@ private:
     void takeHeapReferences();
     Context context;
     bool stagingAllowed = false;
+    bool addressStaging = true;
     bool adjustedRegions = false;
     GuestAllocations::Lease lease;
     // The cached address space this build maps through (its lease pins the ranges); `regions` then
@@ -497,11 +542,14 @@ private:
     bool regionsOverlap = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> readsOverBase;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> servedInsideBase;
     std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> heapReferences;
+    std::vector<std::pair<std::uint64_t, std::shared_ptr<Buffer>>> heapReadbacks;
     // UploadPrepare ran (regions are frozen); `uploaded` once UploadFinish ran.
     bool prepared = false;
     bool uploaded = false;
     bool committed = false;
+    mutable std::uint64_t directWritesGeneration = 0;
 };
 
 }
