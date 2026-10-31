@@ -298,6 +298,7 @@ struct HostImports {
     std::uint64_t buildFloor = 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> unwatchedNotes;
     bool unwatchProbed = false;
+    bool probeUnwatched = false;
     std::uint64_t frameFloor = 0;
     std::uint64_t previousFrameFloor = 0;
     std::uint64_t framesEnded = 0;
@@ -1298,6 +1299,8 @@ void decideImportWatch(const Context& context, HostImports& state) {
     state.watchDevice = context.device;
     state.unwatchImports = false;
     state.unwatchDmaBufImports = false;
+    state.unwatchProbed = false;
+    state.probeUnwatched = false;
     if (context.hostImportAlignment == 0 || !GuestMemory::WriteWatched()) return;
     if (request == ImportWatchRequest::Watch) {
         std::fprintf(stderr, "[write-watch] host imports stay watched (APS5_WRITE_WATCH_IMPORTS=watch)\n");
@@ -1315,8 +1318,9 @@ void decideImportWatch(const Context& context, HostImports& state) {
         std::fprintf(stderr, "[write-watch] host imports resolve write protection: unknown (probe failed at %s, %d); imported ranges are compared\n", probe.failure, static_cast<int>(probe.result));
     } else {
         state.unwatchImports = probe.writtenAfterSubmit != 0 || probe.writtenAfterFill != 0;
+        state.probeUnwatched = state.unwatchImports;
         state.unwatchProbed = state.unwatchImports;
-        if (state.unwatchImports) shrinkImportWindow();
+        if (state.unwatchProbed) shrinkImportWindow();
         std::fprintf(stderr, "[write-watch] host imports resolve write protection: %s (%u of %u scratch pages written after a GPU read, %u after a GPU write, %u after the import); imported ranges %s\n", state.unwatchImports ? "yes" : "no", probe.writtenAfterSubmit, probe.pages, probe.writtenAfterFill, probe.writtenAtImport, state.unwatchImports ? "are compared" : "stay watched");
     }
     state.unwatchDmaBufImports = state.unwatchImports;
@@ -4013,15 +4017,15 @@ ImportWatch PrepareImportWatch(const Context& context) {
     return state.unwatchImports ? ImportWatch::Unwatch : ImportWatch::Watch;
 }
 
-void SetImportWatch(const Context& context, ImportWatch watch) {
+void SetImportWatch(const Context& context, ImportWatch watch, bool probed) {
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
     state.watchDevice = context.device;
     state.unwatchImports = watch == ImportWatch::Unwatch;
-    state.unwatchProbed = state.unwatchImports;
+    state.unwatchProbed = state.unwatchImports && (probed || state.probeUnwatched);
     state.unwatchDmaBufImports = state.unwatchImports;
     state.gateRefusals.clear();
-    if (state.unwatchImports) shrinkImportWindow();
+    if (state.unwatchProbed) shrinkImportWindow();
 }
 
 void SetHostImportWindow(std::uint64_t bytes) {

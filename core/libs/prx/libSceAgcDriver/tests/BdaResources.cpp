@@ -528,7 +528,7 @@ void idleImportRetireTests(const Context& context) {
     };
     change(guest, true);
     change(guest + piece, true);
-    SetImportWatch(importing, ImportWatch::Unwatch);
+    SetImportWatch(importing, ImportWatch::Unwatch, true);
     Require(HostImportFor(importing, first, 16) != nullptr && HostImportFor(importing, first + piece, 16) != nullptr, "the idle fixture did not import");
     Require(RetireIdleImports(importing) == 0 && ExistingHostImportFor(importing, first, 16) != nullptr, "an import used this frame was retired");
     for (int frame = 0; frame < 59; ++frame) NoteHostImportFrame();
@@ -4358,7 +4358,7 @@ void unwatchedImportWindowTests(const Context& context) {
         GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
     };
     for (std::size_t index = 0; index < 4; ++index) change(guest + index * piece, true);
-    SetImportWatch(importing, ImportWatch::Unwatch);
+    SetImportWatch(importing, ImportWatch::Unwatch, true);
     Require(HostImportsUnwatch(importing), "the device's imports were not declared unwatching");
     const auto* one = HostImportFor(importing, first + piece + 16, 32);
     Require(one != nullptr && one->base == first + piece && one->bytes == piece, "an unwatching device imported more than the allocation it serves");
